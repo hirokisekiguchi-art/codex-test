@@ -484,50 +484,44 @@ def podcast_get_img_size(path:str) -> tuple[int,int]:
 
 
 
-def podcast_create_ass_content(
-segs, w, h,
-font, fs_pct, txt_col, txt_alpha,
-bold, italic, ul, strike,
-align, margin_pct, wrap, char_spacing,
-use_out, out_w, use_shad, shad_d, out_col,
-use_bg, bg_col, bg_alpha,
-speed=1.0
+
+def podcast_build_ass_text(
+    segs, w, h,
+    font, fs_pct, txt_col, txt_alpha,
+    bold, italic, ul, strike,
+    align, margin_pct, wrap, char_spacing,
+    use_out, out_w, use_shad, shad_d, out_col,
+    use_bg, bg_col, bg_alpha,
+    speed=1.0
 ) -> str:
-"""ASSファイルのテキスト内容を生成する (ポッドキャスト用)"""
-fs = int(h * (fs_pct / 100))
-mv = int(h * (margin_pct / 100))
-prim_c = hex_to_ass(txt_col, txt_alpha)
-if use_bg:
-    border_style = 3
-    out_c_ass = hex_to_ass(bg_col, bg_alpha)
-    back_c = "&HFF000000"
-else:
-    border_style = 1
-    out_c_ass = hex_to_ass(out_col, 100)
-    if use_shad:
-        back_c = hex_to_ass(out_col, 50)
-    else:
+    """ASSファイルのテキスト内容を生成する (ポッドキャスト用)"""
+    fs = int(h * (fs_pct / 100))
+    mv = int(h * (margin_pct / 100))
+    prim_c = hex_to_ass(txt_col, txt_alpha)
+    if use_bg:
+        border_style = 3
+        out_c_ass = hex_to_ass(bg_col, bg_alpha)
         back_c = "&HFF000000"
-bold_f, italic_f = ("-1" if bold else "0"), ("-1" if italic else "0")
-ul_f, strike_f = ("-1" if ul else "0"), ("-1" if strike else "0")
-# [BUGFIX] 座布団(use_bg)が有効な場合、縁取り(use_out)の状態に関わらず、
-# '太さ'(out_w)をASSのOutline値として使用するよう修正。
-if use_bg:
-    final_out_w = out_w
-    print(f"[DEBUG] podcast_create_ass_content: 座布団が有効なため、'太さ'({out_w})をOutline値として使用します。")
-else:
-    final_out_w = out_w if use_out else 0
-    print(f"[DEBUG] podcast_create_ass_content: 座布団は無効。縁取り有効({use_out}) -> Outline値は{final_out_w}です。")
-final_shad_d = shad_d if use_shad else 0
+    else:
+        border_style = 1
+        out_c_ass = hex_to_ass(out_col, 100)
+        if use_shad:
+            back_c = hex_to_ass(out_col, 50)
+        else:
+            back_c = "&HFF000000"
+    bold_f, italic_f = ("-1" if bold else "0"), ("-1" if italic else "0")
+    ul_f, strike_f = ("-1" if ul else "0"), ("-1" if strike else "0")
+    # [BUGFIX] 座布団(use_bg)が有効な場合、縁取り(use_out)の状態に関わらず、
+    # '太さ'(out_w)をASSのOutline値として使用するよう修正。
+    if use_bg:
+        final_out_w = out_w
+        print(f"[DEBUG] podcast_create_ass_content: 座布団が有効なため、'太さ'({out_w})をOutline値として使用します。")
+    else:
+        final_out_w = out_w if use_out else 0
+        print(f"[DEBUG] podcast_create_ass_content: 座布団は無効。縁取り有効({use_out}) -> Outline値は{final_out_w}です。")
+    final_shad_d = shad_d if use_shad else 0
 
-
-
-
-
-
-
-
-header = textwrap.dedent(f"""
+    header = textwrap.dedent(f"""
 [Script Info]
 ScriptType: v4.00+
 PlayResX: {w}
@@ -539,33 +533,24 @@ Style: DEF,{font},{fs},{prim_c},{prim_c},{out_c_ass},{back_c},{bold_f},{italic_f
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 """).strip()
 
-
-
-
-
-
-
-
-events = ""
-if float(speed) != 1.0:
-   print(f"[DEBUG] 字幕タイミングを再生速度 {speed}x に合わせて調整します。")
-for s in segs:
-    text = s["text"]
-    if wrap > 0 and len(text) > wrap:
-         text = r"\N".join(textwrap.wrap(text, int(wrap)))
-    start_time = s['start'] / float(speed)
-    end_time = s['end'] / float(speed)
+    events = ""
     if float(speed) != 1.0:
-       print(f"  [DEBUG] ASSタイムコード調整: original=({s['start']:.2f}s, {s['end']:.2f}s) -> adjusted=({start_time:.2f}s, {end_time:.2f}s)")
-    events += f"Dialogue: 0,{tc(start_time)},{tc(end_time)},DEF,,0,0,0,,{text}\n" # MarginVを0に固定
-return header + "\n" + events
+        print(f"[DEBUG] 字幕タイミングを再生速度 {speed}x に合わせて調整します。")
+    for s in segs:
+        text = s["text"]
+        if wrap > 0 and len(text) > wrap:
+            text = r"\N".join(textwrap.wrap(text, int(wrap)))
+        start_time = s['start'] / float(speed)
+        end_time = s['end'] / float(speed)
+        if float(speed) != 1.0:
+            print(f"  [DEBUG] ASSタイムコード調整: original=({s['start']:.2f}s, {s['end']:.2f}s) -> adjusted=({start_time:.2f}s, {end_time:.2f}s)")
+        events += f"Dialogue: 0,{tc(start_time)},{tc(end_time)},DEF,,0,0,0,,{text}\n"  # MarginVを0に固定
+    return header + "\n" + events
 
 
-
-
-
-
-
+def podcast_create_ass_content(*args, **kwargs):
+    """Backward compatible wrapper delegating to podcast_build_ass_text."""
+    return podcast_build_ass_text(*args, **kwargs)
 
 def podcast_generate_preview(
 bg_img, font, fs_pct, txt_col, txt_alpha,
