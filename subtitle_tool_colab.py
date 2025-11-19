@@ -95,11 +95,19 @@ print("✅ 統合環境の構築が完了しました")
 # 2. 共通および各機能の関数定義
 # ==============================================================================
 import argparse, json, os, shutil, subprocess, tempfile, textwrap, datetime, sys, re, traceback
+from functools import partial
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 from PIL import Image
 import cv2
 import gradio as gr
+
+try:
+    from google.colab import drive as gdrive  # type: ignore
+except ImportError:  # pragma: no cover - Colab固有のモジュール
+    gdrive = None
 
 
 
@@ -196,6 +204,254 @@ def hex_to_ass(hex_color: str, alpha_percent: float = 0.0) -> str:
 AVAILABLE_FONTS = ["Noto Sans CJK JP", "Noto Serif CJK JP", "IPAGothic", "IPAMincho"]
 
 
+PRESET_TYPES = {"podcast", "subtitler"}
+DEFAULT_NOTEBOOK_NAME = "MyNotebook"
+PRESET_ROOT_NAME = "Subtitle_Presets"
+STYLE_FIELD_ORDER = [
+    "font", "fs_pct", "txt_col", "txt_alpha",
+    "bold", "italic", "underline", "strike",
+    "align", "margin_pct", "wrap", "char_spacing",
+    "speed",
+    "use_out", "out_w", "use_shad", "shad_d", "out_col",
+    "use_bg", "bg_col", "bg_alpha"
+]
+
+STYLE_VALIDATION_RULES = {
+    "font": {"type": str, "choices": AVAILABLE_FONTS},
+    "fs_pct": {"type": (int, float), "min": 1, "max": 20},
+    "txt_col": {"type": str},
+    "txt_alpha": {"type": (int, float), "min": 0, "max": 100},
+    "bold": {"type": bool},
+    "italic": {"type": bool},
+    "underline": {"type": bool},
+    "strike": {"type": bool},
+    "align": {"type": (int, float), "choices": list(range(1, 10))},
+    "margin_pct": {"type": (int, float), "min": 0, "max": 50},
+    "wrap": {"type": (int, float), "min": 0, "max": 50},
+    "char_spacing": {"type": (int, float), "min": 0, "max": 10},
+    "speed": {"type": (int, float), "min": 0.5, "max": 2.0},
+    "use_out": {"type": bool},
+    "out_w": {"type": (int, float), "min": 0, "max": 10},
+    "use_shad": {"type": bool},
+    "shad_d": {"type": (int, float), "min": 0, "max": 10},
+    "out_col": {"type": str},
+    "use_bg": {"type": bool},
+    "bg_col": {"type": str},
+    "bg_alpha": {"type": (int, float), "min": 0, "max": 100},
+}
+
+_drive_mounted = False
+_local_drive_fallback = Path("./local_drive").resolve()
+
+
+def sanitize_notebook_name(name: Optional[str]) -> str:
+    """ノートブック名をファイルシステムに安全な形式へ整形"""
+    if not name:
+        return DEFAULT_NOTEBOOK_NAME
+    safe = re.sub(r"[^\w\-一-龠ぁ-んァ-ヶＡ-Ｚａ-ｚ０-９（）() ]+", "_", name.strip())
+    safe = safe.strip()
+    return safe or DEFAULT_NOTEBOOK_NAME
+
+
+def sanitize_filename(name: Optional[str]) -> str:
+    if not name:
+        return "preset"
+    safe = re.sub(r"[^\w\-一-龠ぁ-んァ-ヶＡ-Ｚａ-ｚ０-９（）() ]+", "_", name.strip())
+    safe = safe.strip("._ ")
+    return safe or "preset"
+
+
+def ensure_drive_mounted() -> Path:
+    """Driveがマウントされていなければdrive.mountを呼び出す"""
+    global _drive_mounted
+    drive_root = Path("/content/drive")
+    mydrive = drive_root / "MyDrive"
+    if mydrive.exists():
+        _drive_mounted = True
+        return mydrive
+    if gdrive is None:
+        _local_drive_fallback.mkdir(parents=True, exist_ok=True)
+        return _local_drive_fallback
+    if not _drive_mounted:
+        print("[INFO] Google Driveをマウントします...")
+        gdrive.mount(str(drive_root))
+        _drive_mounted = True
+    mydrive.mkdir(parents=True, exist_ok=True)
+    return mydrive
+
+
+def get_preset_directory(notebook_name: str, preset_type: str, create: bool = True) -> Path:
+    if preset_type not in PRESET_TYPES:
+        raise ValueError(f"Unknown preset type: {preset_type}")
+    base_dir = ensure_drive_mounted()
+    safe_notebook = sanitize_notebook_name(notebook_name)
+    preset_dir = base_dir / PRESET_ROOT_NAME / safe_notebook / preset_type
+    if create:
+        preset_dir.mkdir(parents=True, exist_ok=True)
+    return preset_dir
+
+
+def list_presets(notebook_name: str, preset_type: str) -> List[str]:
+    preset_dir = get_preset_directory(notebook_name, preset_type, create=True)
+    if not preset_dir.exists():
+        return []
+    return sorted([p.name for p in preset_dir.glob("*.json")])
+
+
+def collect_style_settings(values: Tuple[Any, ...]) -> Dict[str, Any]:
+    settings = {}
+    for key, value in zip(STYLE_FIELD_ORDER, values):
+        if isinstance(value, (np.generic,)):
+            value = value.item()
+        settings[key] = value
+    return settings
+
+
+def _is_valid_color(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return True
+    if value.lower().startswith("rgba") or value.lower().startswith("rgb"):
+        return True
+    return False
+
+
+def validate_style_settings(settings: Dict[str, Any], preset_type: str) -> Tuple[bool, Optional[str]]:
+    if preset_type not in PRESET_TYPES:
+        return False, "不明なプリセット種別です。"
+    for key in STYLE_FIELD_ORDER:
+        if key not in settings:
+            return False, f"必須キー {key} が見つかりません。"
+        rule = STYLE_VALIDATION_RULES.get(key)
+        if not rule:
+            continue
+        value = settings[key]
+        expected_type = rule["type"]
+        if expected_type is bool:
+            if not isinstance(value, bool):
+                return False, f"{key} は真偽値である必要があります。"
+        elif not isinstance(value, expected_type):
+            return False, f"{key} の値が不正です。"
+        if key in {"txt_col", "out_col", "bg_col"}:
+            if not _is_valid_color(value):
+                return False, f"{key} の色指定が不正です。"
+            continue
+        if "choices" in rule:
+            if value not in rule["choices"]:
+                return False, f"{key} の値が許可されていません。"
+        if "min" in rule and value < rule["min"]:
+            return False, f"{key} の値が下限({rule['min']})を下回っています。"
+        if "max" in rule and value > rule["max"]:
+            return False, f"{key} の値が上限({rule['max']})を超えています。"
+    return True, None
+
+
+def _write_preset_file(directory: Path, base_name: str, payload: Dict[str, Any]) -> Path:
+    safe_base = sanitize_filename(base_name)
+    candidate = directory / f"{safe_base}.json"
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{safe_base}({counter}).json"
+        counter += 1
+    with candidate.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return candidate
+
+
+def save_preset_to_drive(notebook_name: str, preset_name: str, preset_type: str, settings: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
+    ok, message = validate_style_settings(settings, preset_type)
+    if not ok:
+        return False, message or "設定が不正です。", None
+    directory = get_preset_directory(notebook_name, preset_type, create=True)
+    payload = {
+        "type": preset_type,
+        "name": preset_name,
+        "created_at": datetime.datetime.utcnow().isoformat(),
+        "settings": settings,
+    }
+    saved_path = _write_preset_file(directory, preset_name or preset_type, payload)
+    return True, "プリセットを保存しました。", saved_path.name
+
+
+def load_preset_from_drive(notebook_name: str, filename: str, preset_type: str) -> Dict[str, Any]:
+    directory = get_preset_directory(notebook_name, preset_type, create=True)
+    preset_path = directory / filename
+    if not preset_path.exists():
+        raise FileNotFoundError("プリセットファイルが見つかりません。")
+    with preset_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if payload.get("type") != preset_type:
+        raise ValueError("プリセットの種類が一致しません。")
+    settings = payload.get("settings")
+    if not isinstance(settings, dict):
+        raise ValueError("プリセット設定が不正です。")
+    ok, message = validate_style_settings(settings, preset_type)
+    if not ok:
+        raise ValueError(message or "設定が不正です。")
+    return settings
+
+
+def handle_preset_save(notebook_name: str, preset_name: str, preset_type: str, *values):
+    if not notebook_name:
+        return gr.Dropdown.update(), "❌ ノートブック名を入力してください。", gr.update(value=preset_name)
+    if not preset_name or not preset_name.strip():
+        return gr.Dropdown.update(), "❌ プリセット名を入力してください。", gr.update(value=preset_name)
+    settings = collect_style_settings(values)
+    ok, message, saved_name = save_preset_to_drive(notebook_name, preset_name, preset_type, settings)
+    choices = list_presets(notebook_name, preset_type)
+    dropdown_update = gr.Dropdown.update(choices=choices, value=saved_name if ok else (choices[0] if choices else None))
+    status = f"✅ {message} ({saved_name})" if ok else f"❌ {message}"
+    clear_name = "" if ok else preset_name
+    return dropdown_update, status, gr.update(value=clear_name)
+
+
+def handle_preset_refresh(notebook_name: str, preset_type: str):
+    choices = list_presets(notebook_name, preset_type)
+    default = choices[0] if choices else None
+    return gr.Dropdown.update(choices=choices, value=default)
+
+
+def handle_preset_load(notebook_name: str, filename: str, preset_type: str):
+    if not filename:
+        raise gr.Error("プリセットが選択されていません。")
+    settings = load_preset_from_drive(notebook_name, filename, preset_type)
+    values = [settings[key] for key in STYLE_FIELD_ORDER]
+    status = f"✅ プリセット『{filename}』を読み込みました。"
+    return (*values, status)
+
+
+def handle_preset_import(uploaded_file, notebook_name: str, preset_type: str):
+    if uploaded_file is None:
+        choices = list_presets(notebook_name, preset_type)
+        default = choices[0] if choices else None
+        return gr.Dropdown.update(choices=choices, value=default), "❌ インポートするJSONを選択してください。", uploaded_file
+    try:
+        with open(uploaded_file.name, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        choices = list_presets(notebook_name, preset_type)
+        default = choices[0] if choices else None
+        return gr.Dropdown.update(choices=choices, value=default), f"❌ JSONの読み込みに失敗しました: {e}", uploaded_file
+    imported_type = payload.get("type")
+    if imported_type != preset_type:
+        choices = list_presets(notebook_name, preset_type)
+        default = choices[0] if choices else None
+        return gr.Dropdown.update(choices=choices, value=default), "❌ プリセットの種類が現在のタブと一致しません。", uploaded_file
+    settings = payload.get("settings")
+    ok, message = validate_style_settings(settings or {}, preset_type)
+    if not ok:
+        choices = list_presets(notebook_name, preset_type)
+        default = choices[0] if choices else None
+        return gr.Dropdown.update(choices=choices, value=default), f"❌ インポートに失敗しました: {message}", uploaded_file
+    preset_name = payload.get("name") or Path(uploaded_file.name).stem
+    _, msg, saved_name = save_preset_to_drive(notebook_name, preset_name, preset_type, settings)
+    choices = list_presets(notebook_name, preset_type)
+    dropdown_update = gr.Dropdown.update(choices=choices, value=saved_name)
+    return dropdown_update, f"✅ {msg} ({saved_name})", None
+
+
 
 
 
@@ -228,50 +484,44 @@ def podcast_get_img_size(path:str) -> tuple[int,int]:
 
 
 
-def podcast_create_ass_content(
-segs, w, h,
-font, fs_pct, txt_col, txt_alpha,
-bold, italic, ul, strike,
-align, margin_pct, wrap, char_spacing,
-use_out, out_w, use_shad, shad_d, out_col,
-use_bg, bg_col, bg_alpha,
-speed=1.0
+
+def podcast_build_ass_text(
+    segs, w, h,
+    font, fs_pct, txt_col, txt_alpha,
+    bold, italic, ul, strike,
+    align, margin_pct, wrap, char_spacing,
+    use_out, out_w, use_shad, shad_d, out_col,
+    use_bg, bg_col, bg_alpha,
+    speed=1.0
 ) -> str:
-"""ASSファイルのテキスト内容を生成する (ポッドキャスト用)"""
-fs = int(h * (fs_pct / 100))
-mv = int(h * (margin_pct / 100))
-prim_c = hex_to_ass(txt_col, txt_alpha)
-if use_bg:
-    border_style = 3
-    out_c_ass = hex_to_ass(bg_col, bg_alpha)
-    back_c = "&HFF000000"
-else:
-    border_style = 1
-    out_c_ass = hex_to_ass(out_col, 100)
-    if use_shad:
-        back_c = hex_to_ass(out_col, 50)
-    else:
+    """ASSファイルのテキスト内容を生成する (ポッドキャスト用)"""
+    fs = int(h * (fs_pct / 100))
+    mv = int(h * (margin_pct / 100))
+    prim_c = hex_to_ass(txt_col, txt_alpha)
+    if use_bg:
+        border_style = 3
+        out_c_ass = hex_to_ass(bg_col, bg_alpha)
         back_c = "&HFF000000"
-bold_f, italic_f = ("-1" if bold else "0"), ("-1" if italic else "0")
-ul_f, strike_f = ("-1" if ul else "0"), ("-1" if strike else "0")
-# [BUGFIX] 座布団(use_bg)が有効な場合、縁取り(use_out)の状態に関わらず、
-# '太さ'(out_w)をASSのOutline値として使用するよう修正。
-if use_bg:
-    final_out_w = out_w
-    print(f"[DEBUG] podcast_create_ass_content: 座布団が有効なため、'太さ'({out_w})をOutline値として使用します。")
-else:
-    final_out_w = out_w if use_out else 0
-    print(f"[DEBUG] podcast_create_ass_content: 座布団は無効。縁取り有効({use_out}) -> Outline値は{final_out_w}です。")
-final_shad_d = shad_d if use_shad else 0
+    else:
+        border_style = 1
+        out_c_ass = hex_to_ass(out_col, 100)
+        if use_shad:
+            back_c = hex_to_ass(out_col, 50)
+        else:
+            back_c = "&HFF000000"
+    bold_f, italic_f = ("-1" if bold else "0"), ("-1" if italic else "0")
+    ul_f, strike_f = ("-1" if ul else "0"), ("-1" if strike else "0")
+    # [BUGFIX] 座布団(use_bg)が有効な場合、縁取り(use_out)の状態に関わらず、
+    # '太さ'(out_w)をASSのOutline値として使用するよう修正。
+    if use_bg:
+        final_out_w = out_w
+        print(f"[DEBUG] podcast_create_ass_content: 座布団が有効なため、'太さ'({out_w})をOutline値として使用します。")
+    else:
+        final_out_w = out_w if use_out else 0
+        print(f"[DEBUG] podcast_create_ass_content: 座布団は無効。縁取り有効({use_out}) -> Outline値は{final_out_w}です。")
+    final_shad_d = shad_d if use_shad else 0
 
-
-
-
-
-
-
-
-header = textwrap.dedent(f"""
+    header = textwrap.dedent(f"""
 [Script Info]
 ScriptType: v4.00+
 PlayResX: {w}
@@ -283,33 +533,24 @@ Style: DEF,{font},{fs},{prim_c},{prim_c},{out_c_ass},{back_c},{bold_f},{italic_f
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 """).strip()
 
-
-
-
-
-
-
-
-events = ""
-if float(speed) != 1.0:
-   print(f"[DEBUG] 字幕タイミングを再生速度 {speed}x に合わせて調整します。")
-for s in segs:
-    text = s["text"]
-    if wrap > 0 and len(text) > wrap:
-         text = r"\N".join(textwrap.wrap(text, int(wrap)))
-    start_time = s['start'] / float(speed)
-    end_time = s['end'] / float(speed)
+    events = ""
     if float(speed) != 1.0:
-       print(f"  [DEBUG] ASSタイムコード調整: original=({s['start']:.2f}s, {s['end']:.2f}s) -> adjusted=({start_time:.2f}s, {end_time:.2f}s)")
-    events += f"Dialogue: 0,{tc(start_time)},{tc(end_time)},DEF,,0,0,0,,{text}\n" # MarginVを0に固定
-return header + "\n" + events
+        print(f"[DEBUG] 字幕タイミングを再生速度 {speed}x に合わせて調整します。")
+    for s in segs:
+        text = s["text"]
+        if wrap > 0 and len(text) > wrap:
+            text = r"\N".join(textwrap.wrap(text, int(wrap)))
+        start_time = s['start'] / float(speed)
+        end_time = s['end'] / float(speed)
+        if float(speed) != 1.0:
+            print(f"  [DEBUG] ASSタイムコード調整: original=({s['start']:.2f}s, {s['end']:.2f}s) -> adjusted=({start_time:.2f}s, {end_time:.2f}s)")
+        events += f"Dialogue: 0,{tc(start_time)},{tc(end_time)},DEF,,0,0,0,,{text}\n"  # MarginVを0に固定
+    return header + "\n" + events
 
 
-
-
-
-
-
+def podcast_create_ass_content(*args, **kwargs):
+    """Backward compatible wrapper delegating to podcast_build_ass_text."""
+    return podcast_build_ass_text(*args, **kwargs)
 
 def podcast_generate_preview(
 bg_img, font, fs_pct, txt_col, txt_alpha,
@@ -1046,6 +1287,12 @@ footer { display: none !important; }
 with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo:
  gr.Markdown("# 字幕作成")
  gr.Markdown("2つの機能をタブで切り替えて使用できます。※「エフェクト」と「座布団」は共存できません。両方ONにすると座布団が優先されます。")
+ notebook_name_input = gr.Textbox(
+     label="Google Colab ノートブック名",
+     value=DEFAULT_NOTEBOOK_NAME,
+     placeholder="例: MySubtitleNotebook",
+     info="プリセットはノートブック名ごとに Google Drive 内へ保存されます。"
+ )
 
 
 
@@ -1110,6 +1357,17 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
                          podcast_bg_col = gr.ColorPicker("#000000", label="座布団の色")
                          podcast_bg_alpha = gr.Slider(0, 100, 50, step=5, label="座布団の不透明度(%)")
                          podcast_btn_reset_bg = gr.Button("デフォルトに戻す", size="sm")
+                     with gr.Accordion("プリセット管理", open=False):
+                         podcast_preset_name = gr.Textbox(label="プリセット名", placeholder="例: 配信用テンプレ")
+                         with gr.Row():
+                             podcast_preset_save_btn = gr.Button("プリセットを保存", variant="primary")
+                             podcast_preset_refresh_btn = gr.Button("一覧を更新")
+                         podcast_preset_dropdown = gr.Dropdown(label="保存済みプリセット", choices=[], interactive=True)
+                         podcast_preset_load_btn = gr.Button("プリセットを読み込み")
+                         with gr.Row():
+                             podcast_preset_import_file = gr.File(label="プリセットJSONをインポート", file_types=[".json"], file_count="single")
+                             podcast_preset_import_btn = gr.Button("インポートして保存")
+                         podcast_preset_status = gr.Markdown("")
 
 
 
@@ -1188,6 +1446,17 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
                          subtitler_bg_col = gr.ColorPicker("#000000", label="座布団の色")
                          subtitler_bg_alpha = gr.Slider(0, 100, 50, step=5, label="座布団の不透明度(%)")
                          subtitler_btn_reset_bg = gr.Button("デフォルトに戻す", size="sm")
+                     with gr.Accordion("プリセット管理", open=False):
+                         subtitler_preset_name = gr.Textbox(label="プリセット名", placeholder="例: テロップ大")
+                         with gr.Row():
+                             subtitler_preset_save_btn = gr.Button("プリセットを保存", variant="primary")
+                             subtitler_preset_refresh_btn = gr.Button("一覧を更新")
+                         subtitler_preset_dropdown = gr.Dropdown(label="保存済みプリセット", choices=[], interactive=True)
+                         subtitler_preset_load_btn = gr.Button("プリセットを読み込み")
+                         with gr.Row():
+                             subtitler_preset_import_file = gr.File(label="プリセットJSONをインポート", file_types=[".json"], file_count="single")
+                             subtitler_preset_import_btn = gr.Button("インポートして保存")
+                         subtitler_preset_status = gr.Markdown("")
 
 
 
@@ -1227,6 +1496,14 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
      podcast_bg_in, podcast_font, podcast_fs, podcast_txt_col, podcast_txt_alpha, podcast_b, podcast_i, podcast_u, podcast_s, podcast_align, podcast_margin, podcast_wrap, podcast_char_spacing,
      # speed slider is not for the image preview
      podcast_use_out, podcast_out_w, podcast_use_shad, podcast_shad_d, podcast_out_col, podcast_use_bg, podcast_bg_col, podcast_bg_alpha
+ ]
+ podcast_style_components_for_presets = [
+     podcast_font, podcast_fs, podcast_txt_col, podcast_txt_alpha,
+     podcast_b, podcast_i, podcast_u, podcast_s,
+     podcast_align, podcast_margin, podcast_wrap, podcast_char_spacing,
+     podcast_speed,
+     podcast_use_out, podcast_out_w, podcast_use_shad, podcast_shad_d, podcast_out_col,
+     podcast_use_bg, podcast_bg_col, podcast_bg_alpha
  ]
  podcast_main_inputs = [
      podcast_audio_in, podcast_bg_in, podcast_script_in,
@@ -1295,6 +1572,27 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
          podcast_use_bg, podcast_bg_col, podcast_bg_alpha
      ])
 
+ podcast_preset_save_btn.click(
+     fn=lambda notebook_name, preset_name, *values: handle_preset_save(notebook_name, preset_name, "podcast", *values),
+     inputs=[notebook_name_input, podcast_preset_name] + podcast_style_components_for_presets,
+     outputs=[podcast_preset_dropdown, podcast_preset_status, podcast_preset_name]
+ )
+ podcast_preset_refresh_btn.click(
+     fn=lambda notebook_name: handle_preset_refresh(notebook_name, "podcast"),
+     inputs=[notebook_name_input],
+     outputs=[podcast_preset_dropdown]
+ )
+ podcast_preset_load_btn.click(
+     fn=lambda notebook_name, filename: handle_preset_load(notebook_name, filename, "podcast"),
+     inputs=[notebook_name_input, podcast_preset_dropdown],
+     outputs=podcast_style_components_for_presets + [podcast_preset_status]
+ )
+ podcast_preset_import_btn.click(
+     fn=lambda file_obj, notebook_name: handle_preset_import(file_obj, notebook_name, "podcast"),
+     inputs=[podcast_preset_import_file, notebook_name_input],
+     outputs=[podcast_preset_dropdown, podcast_preset_status, podcast_preset_import_file]
+ )
+
 
 
 
@@ -1310,6 +1608,14 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
  subtitler_style_inputs = [
      subtitler_video_in, subtitler_font, subtitler_fs, subtitler_txt_col, subtitler_txt_alpha, subtitler_b, subtitler_i, subtitler_u, subtitler_s, subtitler_align, subtitler_margin, subtitler_wrap, subtitler_char_spacing,
      subtitler_use_out, subtitler_out_w, subtitler_use_shad, subtitler_shad_d, subtitler_out_col, subtitler_use_bg, subtitler_bg_col, subtitler_bg_alpha
+ ]
+ subtitler_style_components_for_presets = [
+     subtitler_font, subtitler_fs, subtitler_txt_col, subtitler_txt_alpha,
+     subtitler_b, subtitler_i, subtitler_u, subtitler_s,
+     subtitler_align, subtitler_margin, subtitler_wrap, subtitler_char_spacing,
+     subtitler_speed,
+     subtitler_use_out, subtitler_out_w, subtitler_use_shad, subtitler_shad_d, subtitler_out_col,
+     subtitler_use_bg, subtitler_bg_col, subtitler_bg_alpha
  ]
  subtitler_main_inputs = [
      subtitler_video_in, subtitler_script_in,
@@ -1358,6 +1664,27 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
  subtitler_btn_reset_effect.click(fn=lambda: (True, 1.5, False, 1.0, "#404040"), outputs=[subtitler_use_out, subtitler_out_w, subtitler_use_shad, subtitler_shad_d, subtitler_out_col])
  subtitler_btn_reset_bg.click(fn=lambda: (False, "#000000", 50), outputs=[subtitler_use_bg, subtitler_bg_col, subtitler_bg_alpha])
 
+ subtitler_preset_save_btn.click(
+     fn=lambda notebook_name, preset_name, *values: handle_preset_save(notebook_name, preset_name, "subtitler", *values),
+     inputs=[notebook_name_input, subtitler_preset_name] + subtitler_style_components_for_presets,
+     outputs=[subtitler_preset_dropdown, subtitler_preset_status, subtitler_preset_name]
+ )
+ subtitler_preset_refresh_btn.click(
+     fn=lambda notebook_name: handle_preset_refresh(notebook_name, "subtitler"),
+     inputs=[notebook_name_input],
+     outputs=[subtitler_preset_dropdown]
+ )
+ subtitler_preset_load_btn.click(
+     fn=lambda notebook_name, filename: handle_preset_load(notebook_name, filename, "subtitler"),
+     inputs=[notebook_name_input, subtitler_preset_dropdown],
+     outputs=subtitler_style_components_for_presets + [subtitler_preset_status]
+ )
+ subtitler_preset_import_btn.click(
+     fn=lambda file_obj, notebook_name: handle_preset_import(file_obj, notebook_name, "subtitler"),
+     inputs=[subtitler_preset_import_file, notebook_name_input],
+     outputs=[subtitler_preset_dropdown, subtitler_preset_status, subtitler_preset_import_file]
+ )
+
 
 
 
@@ -1366,8 +1693,13 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
 
 
  # [リスナー] 初期プレビュー生成
- demo.load(fn=podcast_generate_preview, inputs=podcast_style_inputs, outputs=podcast_preview_img)
- demo.load(fn=subtitler_generate_preview, inputs=subtitler_style_inputs, outputs=subtitler_preview_img)
+demo.load(fn=podcast_generate_preview, inputs=podcast_style_inputs, outputs=podcast_preview_img)
+demo.load(fn=subtitler_generate_preview, inputs=subtitler_style_inputs, outputs=subtitler_preview_img)
+demo.load(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "podcast"), inputs=[notebook_name_input], outputs=[podcast_preset_dropdown])
+demo.load(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "subtitler"), inputs=[notebook_name_input], outputs=[subtitler_preset_dropdown])
+
+notebook_name_input.change(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "podcast"), inputs=[notebook_name_input], outputs=[podcast_preset_dropdown])
+notebook_name_input.change(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "subtitler"), inputs=[notebook_name_input], outputs=[subtitler_preset_dropdown])
 
 
 
