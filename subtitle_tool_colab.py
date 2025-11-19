@@ -1692,6 +1692,14 @@ with gr.Blocks(theme=gr.themes.Default(), css=CSS, title="字幕作成") as demo
 
 
 
+    # [リスナー] 初期プレビュー生成
+    demo.load(fn=podcast_generate_preview, inputs=podcast_style_inputs, outputs=podcast_preview_img)
+    demo.load(fn=subtitler_generate_preview, inputs=subtitler_style_inputs, outputs=subtitler_preview_img)
+    demo.load(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "podcast"), inputs=[notebook_name_input], outputs=[podcast_preset_dropdown])
+    demo.load(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "subtitler"), inputs=[notebook_name_input], outputs=[subtitler_preset_dropdown])
+
+    notebook_name_input.change(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "podcast"), inputs=[notebook_name_input], outputs=[podcast_preset_dropdown])
+    notebook_name_input.change(fn=lambda notebook_name: handle_preset_refresh(notebook_name, "subtitler"), inputs=[notebook_name_input], outputs=[subtitler_preset_dropdown])
  # [リスナー] 初期プレビュー生成
 demo.load(fn=podcast_generate_preview, inputs=podcast_style_inputs, outputs=podcast_preview_img)
 demo.load(fn=subtitler_generate_preview, inputs=subtitler_style_inputs, outputs=subtitler_preview_img)
